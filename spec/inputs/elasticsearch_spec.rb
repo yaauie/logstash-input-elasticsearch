@@ -91,6 +91,42 @@ describe LogStash::Inputs::TestableElasticsearch do
     expect(event.get("message")).to eql [ "ohayo" ]
   end
 
+  context 'an invalid event' do
+    let(:response) do
+      {"hits" => outer_hits}
+    end
+    let(:scroll_response) do
+      {
+          "_scroll_id" => "1234",
+          "hits" => { "hits" => [] }
+      }
+    end
+    let(:outer_hits) { {"total" => hits.count, "max_score" => 1.0, hits => hits} }
+    let(:hits) { [invalid_event_hit] }
+
+    let(:client) { Elasticsearch::Client.new }
+    before(:each) do
+      expect(Elasticsearch::Client).to receive(:new).and_return(client)
+      allow(client).to receive(:search).with(any_args).and_return(response)
+      allow(client).to receive(:scroll).with(any_args).and_return(scroll_response)
+      allow(client).to receive(:clear_scroll).and_return(nil)
+    end
+
+    context '@timestamp as object' do
+      let(:invalid_event_hit) do
+        {"_source" => {"@timestamp" => {"year" => 2020, "month" => 7, "day" => 20}}}
+      end
+
+    end
+    context 'invalid field reference' do
+      let(:invalid_event_hit) do
+        {"_source" => {"fo[as]]]][sasd[" => "nope"}}
+      end
+
+
+    end
+  end
+
 
   # This spec is an adapter-spec, ensuring that we send the right sequence of messages to our Elasticsearch Client
   # to support sliced scrolling. The underlying implementation will spawn its own threads to consume, so we must be
@@ -673,5 +709,67 @@ describe LogStash::Inputs::TestableElasticsearch do
       Timecop.return
     end
 
+  end
+
+  context '#push_hit(hit, output_queue)' do
+    let(:logger_stub) { double('Logger').as_null_object }
+    let(:elasticsearch_client_stub) { double('Elasticsearch::Client') }
+    before(:each) do
+      allow(described_class).to receive(:logger).and_return(logger_stub)
+      expect(Elasticsearch::Client).to receive(:new).with(any_args).and_return(elasticsearch_client_stub)
+    end
+    subject(:elasticsearch_input_plugin) { described_class.new(config).tap(&:register) }
+
+    let(:config) { Hash[] }
+
+    context 'valid event' do
+      let(:hit) { Hash["_source" => { "fruit" => "banana" }, "_index" => "foo", "_type" => "_doc", "_id" => "abad1dea"] }
+      it 'emits a LogStash::Event' do
+        queue = []
+        elasticsearch_input_plugin.send(:push_hit, hit, queue)
+
+        expect(queue.size).to eq(1)
+        event = queue.pop
+        expect(event).to be_a_kind_of(LogStash::Event)
+        # TODO: validate shape better
+      end
+    end
+    context 'invalid events' do
+      shared_examples 'invalid event handling' do
+        it 'logs a helpful message' do
+          elasticsearch_input_plugin.send(:push_hit, hit, [])
+
+          expect(logger_stub).to have_received(:warn).with(/Exception creating event/, a_kind_of(Hash))
+        end
+
+        it 'emits a tagged event containing the JSON-encoded hit' do
+          queue = []
+          elasticsearch_input_plugin.send(:push_hit, hit, queue)
+
+          expect(queue.size).to eq(1)
+          event = queue.pop
+
+          puts event.to_hash.inspect
+          expect(event).to be_a_kind_of(LogStash::Event)
+          expect(event.get('tags')).to_not be_nil
+          expect(event.get('tags')).to include('_elasticsearchinputerror')
+
+          expect(event.to_hash).to include('message')
+
+          # TODO: validate that message is the jsonification of the hit
+        end
+      end
+      context 'invalid event' do
+        let(:hit) { Hash["_source" => { "[[s[sd]" => "bad field reference" }, "_index" => "foo", "_type" => "_doc", "_id" => "abad1dea"] }
+
+        include_examples 'invalid event handling'
+      end
+      context 'event with incompatible docinfo_target' do
+        let(:config) { super().merge("docinfo" => "true", "docinfo_target" => "fruit")}
+        let(:hit) { Hash["_source" => { "fruit" => "apple" }, "_index" => "foo", "_type" => "_doc", "_id" => "abad1dea"] }
+
+        include_examples 'invalid event handling'
+      end
+    end
   end
 end

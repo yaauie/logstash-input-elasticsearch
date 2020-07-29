@@ -323,6 +323,13 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
     decorate(event)
 
     output_queue << event
+  rescue Exception => e
+    payload = { :exception => e.inspect }
+    payload.update(:backtrace => e.backtrace) if logger.debug?
+    @logger.warn("Exception creating event", payload)
+
+    output_queue <<  LogStash::Event.new({"message" => LogStash::Json.dump(hit),
+                                          "tags"    => %w(_elasticsearchinputerror)})
   end
 
   def clear_scroll(scroll_id)
